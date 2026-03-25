@@ -7,14 +7,21 @@ import pysvzerod as zerod
 import json
 import copy
 
+from SALib.sample import sobol as sobol_sample
+from SALib.analyze import sobol
+from SALib.test_functions import Ishigami
+
 # Need to establish test cases and error tests
 
+# Reads file that is passed as parameter (myfile) and returns the contents of the file
 def read_file(myfile):
     with open(myfile, "r") as file:
         data = json.load(file)
     return data
 
-
+# Returns the 0D element values of ChamberSphere, Upstream_vessel, and 
+# Downstream_vessel 0D element types/names given data from a parsed
+# file read using read_file function given above 
 def get_chamber_params(data):
     vessels = data["vessels"]
 
@@ -34,6 +41,8 @@ def get_chamber_params(data):
 
     return params, down_vals, up_vals
 
+# Returns the resistance value of the given vessel name, if possible
+# Otherwise returns error
 def get_res(data, ves_name):
     for ves in data["vessels"]:
 
@@ -43,7 +52,9 @@ def get_res(data, ves_name):
             if "R_poiseuille" in vals:
                 return vals["R_poiseuille"]
             else:
-                print("Error: Given vessel type does not contain resistance parameter")
+               raise LookupError("Error: Given vessel type does not contain resistance parameter")
+            
+    raise LookupError(f"Vessel '{ves_name}' not found in data.")
 
 def change_res(data, scaler, ves_name):
     perturbed_res = scaler*get_res(data, ves_name)
@@ -134,6 +145,89 @@ def change_cap(data, scaler, ves_name):
                 vals["C"] *= scaler
 
 
+# Function that measures sensitivity of pressure (could generalize to allow user to decide - create parameter to allow this eventually) 
+# through the sobol variance-based method (as used and slightly detailed Saltelli et al. (2010)).
+# Need to estimate "sensitivity indices" of the "first-order, second-order, and total effect indices." (requires emulator...)
+def sobol_sensitivity(data,ves_name):
+    #first order sensitivity coefficient is given as
+    # sensitivity_i = \frac{Variance_{X_i}(E_{X_\sim i}(Y | X_i)}{Variance(Y)}
+
+    # total effect index is given as
+    # sensitivity_{T_i} = 1-\frac{Variance_{X_i}(E_{X_\sim i}(Y | X_i)}{Variance(Y)}
+    # which measures the total effect, i.e. first and higer order effects (interactions) of
+    # factor X_i. 
+
+    placeholder = 1
+
+####
+# Below are the SALib-based functions
+####
+
+# Parameters:
+# 
+def evaluate_model(data, params):
+    Y = np.zeros(len(params))
+
+    # index i, element X (which is a singular row of column vector params)
+    for i, X in enumerate(params):
+        perturbed_data = copy.deepcopy(data)
+
+        # Getting the following error: RuntimeError: Maximum number of non-linear iterations reached.
+        # Thus, failing due to zerodsolver as opposed to SALib, meaning parameters causing
+        # error. DO try/except and then analyze where the simulation is failing.
+        # Ask insight from Martin on why he thinks solver is failing. Is it that the 
+        # parameters are so physically impropable that the values just cause the solver
+        # to crash?
+        # Tried the above, which allowed sobol to run successfully, but then some of
+        # the sobol SA outputs were NaN. Thus, will just reduce the range of the
+        # bounds from 0.5 - 2.0 to 0.8 - 1.2 and see how that works
+        Up_res_scaler = X[0]  
+        Down_res_scaler = X[1]
+        Up_cap_scaler = X[2]
+        Down_cap_scaler = X[3]
+
+
+
+
+        change_res(perturbed_data, Up_res_scaler, "upstream_vessel")
+        change_res(perturbed_data, Down_res_scaler, "downstream_vessel")
+        change_cap(perturbed_data, Up_cap_scaler, "upstream_vessel")
+        change_res(perturbed_data, Down_cap_scaler, "downstream_vessel")
+
+        Y[i] = get_p_metric(perturbed_data, "max") #computing Y = f(X) essentially
+    
+    # except:
+    #     print(f"Zerod simulation failed at index i = {i}, given params: {X}")
+    #     Y[i] = np.nan
+    
+    # # Debugging to ensure size mistmatch isn't cause for indexing error
+    # print("param_values shape:", params.shape)
+    # print("Y shape:", Y.shape)
+
+    return Y
+
+def sobol_sensitivity(data):
+    problem = {
+        'num_vars': 4,
+        'names': ['Up_res', "Down_res", "Up_cap", 'Down_cap'],
+        'bounds': [[0.8, 1.2]]*4 # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
+    }
+
+    # Using 512 as arbitrary sample size (for greater accuracy, could 
+    # double or quadurple sample size). Want to keep sample size power of 2
+    # This step generates the input (sobol) parameter set
+    # Total # of model evaluations will be N (2*NV+2), where NV is number of variables (given NV>1)
+    params = sobol_sample.sample(problem, 512, calc_second_order=True) 
+
+    Y = evaluate_model(data, params)
+
+    # Provides insight into how much each parameter contributes to output variance
+    # Essentially the actual evaluation step where the sobol variance-based
+    # sensitivty analysis formula described in Stelli is evaluated.
+    Si = sobol.analyze(problem, Y, calc_second_order=True, print_to_console=True)
+
+    return Si
+
 ####################
 # End of functions #
 ####################
@@ -145,42 +239,17 @@ baseline_input = read_file(fname)
 baseline_input["simulation_parameters"]["number_of_cardiac_cycles"] = 2
 baseline_input["simulation_parameters"]["output_all_cycles"] = False
 
-perturbed_input = copy.deepcopy(baseline_input)
-
-baseline_results = zerod.simulate(baseline_input)
-
-baseline_pressure = np.array(baseline_results[baseline_results.name == "pressure:outlet_valve:downstream_vessel"].y) # Accesses LV Pressure
-
 # pdb.set_trace() # review documentation (placed here in order to analyze baseline_
                 #results.name)
 
+problem = {
+    'num_vars': 4, 
+    'names': ['Up_res', "Down_res", "Up_cap", 'Down_cap'],
+    'bounds': [[0.8, 1.2]]*4 # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
+}
 
-p_max = np.max(baseline_pressure)
-
-plt.plot(baseline_pressure, label="Baseline")
-
-
-cur_params, cur_down_vals, cur_up_vals = get_chamber_params(baseline_input)
-
-
-# Perform sensitivity analysis on upstream/downstream vessel resistance for given file
-change_res(perturbed_input, 1.15, "downstream_vessel")
-
-down_res_results = zerod.simulate(perturbed_input)
-
-perturbed_pressure = np.array(down_res_results[down_res_results.name == "pressure:outlet_valve:downstream_vessel"].y)
-p_max = np.max(perturbed_pressure)
-
-plt.plot(perturbed_pressure, label="Perturbed (resistance*1.15)")
-plt.title("Pressure vs Time")
-plt.legend()
-plt.show()
+params = sobol_sample.sample(problem, 512)
 
 
-
-create_pmax_res_graph(baseline_input, "downstream_vessel", 10)
-
-
-# Need to check how sensitivity is calculated in paper
-# Need to evaluate upstream_vals
+Si = sobol_sensitivity(baseline_input)
 
