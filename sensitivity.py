@@ -145,72 +145,127 @@ def change_cap(data, scaler, ves_name):
                 vals["C"] *= scaler
 
 
-# Function that measures sensitivity of pressure (could generalize to allow user to decide - create parameter to allow this eventually) 
-# through the sobol variance-based method (as used and slightly detailed Saltelli et al. (2010)).
-# Need to estimate "sensitivity indices" of the "first-order, second-order, and total effect indices." (requires emulator...)
-def sobol_sensitivity(data,ves_name):
-    #first order sensitivity coefficient is given as
-    # sensitivity_i = \frac{Variance_{X_i}(E_{X_\sim i}(Y | X_i)}{Variance(Y)}
+def create_dict(json_file):
+    param_dict = {}
 
-    # total effect index is given as
-    # sensitivity_{T_i} = 1-\frac{Variance_{X_i}(E_{X_\sim i}(Y | X_i)}{Variance(Y)}
-    # which measures the total effect, i.e. first and higer order effects (interactions) of
-    # factor X_i. 
+    for ves in json_file["vessels"]:
+        name = ves["vessel_name"]
+        params = {}
 
-    placeholder = 1
+        for k, v in ves["zero_d_element_values"].items():
+            if isinstance(v, (int, float)):
+                params[k] = v
 
+        if params:
+            param_dict[name] = {
+                "type": "vessel",
+                "params": params
+            }
+
+    for valve in json_file["valves"]:
+        name = valve["name"]
+        params = {}
+
+        for k, v in valve["params"].items():
+            if isinstance(v, (int, float)):
+                params[k] = v
+        if params:
+            param_dict[name] = {
+                "type": "valve",
+                "params": params
+            }
+
+    return param_dict
+
+def create_indicators(param_dict):
+    param_indicators = []
+    param_map = []
+
+    for ves_name, block in param_dict.items():
+        for param_name in block["params"]:
+            ves_param_name = f"{ves_name}-{param_name}"
+
+            param_indicators.append(ves_param_name)
+
+            param_map.append({
+                "type": block["type"],
+                "name": ves_name,
+                "param": param_name
+            })
+
+
+    return param_indicators, param_map
+    
 ####
 # Below are the SALib-based functions
 ####
 
 # Parameters:
 # 
-def evaluate_model(data, params):
+def evaluate_model(data, params, param_map, metric):
     Y = np.zeros(len(params))
+    failures = 1
 
     # index i, element X (which is a singular row of column vector params)
     for i, X in enumerate(params):
         perturbed_data = copy.deepcopy(data)
 
-        # Getting the following error: RuntimeError: Maximum number of non-linear iterations reached.
-        # Thus, failing due to zerodsolver as opposed to SALib, meaning parameters causing
-        # error. DO try/except and then analyze where the simulation is failing.
-        # Ask insight from Martin on why he thinks solver is failing. Is it that the 
-        # parameters are so physically impropable that the values just cause the solver
-        # to crash?
-        # Tried the above, which allowed sobol to run successfully, but then some of
-        # the sobol SA outputs were NaN. Thus, will just reduce the range of the
-        # bounds from 0.5 - 2.0 to 0.8 - 1.2 and see how that works
-        Up_res_scaler = X[0]  
-        Down_res_scaler = X[1]
-        Up_cap_scaler = X[2]
-        Down_cap_scaler = X[3]
+        failed_params = []
 
+        for j, val in enumerate(param_map):
+            ves = val["name"]
+            param = val["param"]
+            scaler = X[j]
 
+            failed_params.append((ves, param,scaler))
 
+            if val["type"] == "vessel":
+                for vessel in perturbed_data["vessels"]:
+                    if vessel["vessel_name"]== ves:
+                        vessel["zero_d_element_values"][param] *= scaler
 
-        change_res(perturbed_data, Up_res_scaler, "upstream_vessel")
-        change_res(perturbed_data, Down_res_scaler, "downstream_vessel")
-        change_cap(perturbed_data, Up_cap_scaler, "upstream_vessel")
-        change_res(perturbed_data, Down_cap_scaler, "downstream_vessel")
+            elif val["type"] == "valve":
+                for valve in perturbed_data["valves"]:
+                    if valve["name"] == ves:
+                        valve["params"][param] *= scaler
 
-        Y[i] = get_p_metric(perturbed_data, "max") #computing Y = f(X) essentially
-    
-    # except:
-    #     print(f"Zerod simulation failed at index i = {i}, given params: {X}")
-    #     Y[i] = np.nan
-    
-    # # Debugging to ensure size mistmatch isn't cause for indexing error
-    # print("param_values shape:", params.shape)
-    # print("Y shape:", Y.shape)
+        try:
+            Y[i] = get_p_metric(perturbed_data, metric)
+
+        except RuntimeError as e:
+            print(f"Failure numer: {failures}")
+            print(f"Simulation failed at index {i}")
+            print("Parameters used:")
+            for ves, param, scaler in failed_params:
+                print(f" {ves}-{param}: {scaler}")
+            print(f"Error message: {e}")
+            failures+=1
+            Y[i] = get_p_metric(data, metric)
 
     return Y
 
-def sobol_sensitivity(data):
+
+# Function that measures sensitivity of pressure (could generalize to allow user to decide - create parameter to allow this eventually) 
+# through the sobol variance-based method (as used and slightly detailed Saltelli et al. (2010)).
+# Need to estimate "sensitivity indices" of the "first-order, second-order, and total effect indices." (requires emulator...)
+#first order sensitivity coefficient is given as
+# sensitivity_i = \frac{Variance_{X_i}(E_{X_\sim i}(Y | X_i)}{Variance(Y)}
+# total effect index is given as
+# sensitivity_{T_i} = 1-\frac{Variance_{X_i}(E_{X_\sim i}(Y | X_i)}{Variance(Y)}
+# which measures the total effect, i.e. first and higer order effects (interactions) of
+# factor X_i. 
+
+#Instead of providing an array of strings containing parameter names/acronyms,
+# establish a dictionary called param_dict  
+def sobol_sensitivity(data, param_dict, bound, metric):    
+    param_indicators, param_map = create_indicators(param_dict)
+
+    num_vars = len(param_indicators)
+
     problem = {
-        'num_vars': 4,
-        'names': ['Up_res', "Down_res", "Up_cap", 'Down_cap'],
-        'bounds': [[0.8, 1.2]]*4 # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
+        'num_vars': num_vars,
+        'names': param_indicators,
+        'bounds': [bound]*num_vars # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
     }
 
     # Using 512 as arbitrary sample size (for greater accuracy, could 
@@ -219,7 +274,7 @@ def sobol_sensitivity(data):
     # Total # of model evaluations will be N (2*NV+2), where NV is number of variables (given NV>1)
     params = sobol_sample.sample(problem, 512, calc_second_order=True) 
 
-    Y = evaluate_model(data, params)
+    Y = evaluate_model(data, params, param_map, metric)
 
     # Provides insight into how much each parameter contributes to output variance
     # Essentially the actual evaluation step where the sobol variance-based
@@ -228,28 +283,71 @@ def sobol_sensitivity(data):
 
     return Si
 
+
+####################
+# Heatmap Function #
+####################
+def sobol_heatmap(Si, index, param_dict):
+    param_indicators, param_map = create_indicators(param_dict)
+
+    Si_index_matrix = np.abs(Si[index])
+         
+    plt.figure(figsize=(10,8))
+    plt.imshow(Si_index_matrix)
+
+    plt.xticks(range(len(param_indicators)), param_indicators, rotation=90)
+    plt.yticks(range(len(param_indicators)), param_indicators)
+
+    plt.colorbar(label=f"{index}")
+    plt.title(f"Sobol {index} sensitivity analysis heatmap - max pressure")
+
+    plt.tight_layout()
+    plt.show()
+
 ####################
 # End of functions #
 ####################
 
 
-fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/svZeroDSolver-jt/tests/cases/chamber_sphere.json"
+LV_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/svZeroDSolver-jt/tests/cases/chamber_sphere.json"
 
-baseline_input = read_file(fname)
-baseline_input["simulation_parameters"]["number_of_cardiac_cycles"] = 2
-baseline_input["simulation_parameters"]["output_all_cycles"] = False
+LV_baseline_input = read_file(LV_fname)
+LV_baseline_input["simulation_parameters"]["number_of_cardiac_cycles"] = 2
+LV_baseline_input["simulation_parameters"]["output_all_cycles"] = False
+
+
+
+Caruel_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity/chamber_sphere_Caruel.json"
+
+Caruel_baseline_input = read_file(Caruel_fname)
+Caruel_baseline_input["simulation_parameters"]["number_of_cardiac_cycles"] = 2
+Caruel_baseline_input["simulation_parameters"]["output_all_cycles"] = False
 
 # pdb.set_trace() # review documentation (placed here in order to analyze baseline_
                 #results.name)
 
-problem = {
-    'num_vars': 4, 
-    'names': ['Up_res', "Down_res", "Up_cap", 'Down_cap'],
-    'bounds': [[0.8, 1.2]]*4 # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
-}
+bound = [0.8,1.2]
+# LV_problem = {
+#     'num_vars': 4, 
+#     'names': ['Up_res', "Down_res", "Up_cap", 'Down_cap'],
+#     'bounds': [[0.8, 1.2]]*4 # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
+# }
 
-params = sobol_sample.sample(problem, 512)
+# Caruel_problem = {
+#     'num_vars': 6, 
+#     'names': ['Up_res', "Down_prox_res","Down_dist_res", "Up_cap", 'Down_prox_cap',"Down_dist_cap"],
+#     'bounds': [[0.8, 1.2]]*6
+# }
 
+LV_dict = create_dict(LV_baseline_input)
 
-Si = sobol_sensitivity(baseline_input)
+Caruel_dict = create_dict(Caruel_baseline_input)
 
+Si_LV = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max")
+
+# Si_Caruel = sobol_sensitivity(Caruel_baseline_input, Caruel_dict, bound, "max")
+
+sobol_heatmap(Si_LV, "S2", LV_dict)
+# heatmap(Si_LV, "S1", LV_dict)
+# heatmap(Si_LV, "ST", LV_dict)
+print(f"S2 values:\n {Si_LV[S2]}")
