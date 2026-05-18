@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import pysvzerod as zerod
 import json
 import copy
+import time
 
 from SALib.sample import sobol as sobol_sample
 from SALib.analyze import sobol
@@ -91,20 +92,20 @@ def get_v_metric(data, metric):
 
     LV_radius = get_radius(data)
 
-    vol = np.array(results[results.name == "volume:ventricle"].y) + LV_radius
+    vol = np.array(results[results.name == "volume:ventricle"].y) + (4/3)*np.pi*LV_radius**3 # need to fix - volume is volume change (calculate baseline volume)
     time = np.array(results[results.name == "volume:ventricle"].time)
 
     if(metric == "max"):
-        p_max = np.max(vol)
-        return p_max
+        v_max = np.max(vol)
+        return v_max
     
     elif(metric == "min"):
-        p_min = np.min(vol)
-        return p_min
+        v_min = np.min(vol)
+        return v_min
     
     elif(metric == "mean"):
-        p_mean = np.mean(vol)
-        return p_mean
+        v_mean = np.mean(vol)
+        return v_mean
 
 
 
@@ -337,16 +338,29 @@ def sobol_sensitivity(data, param_dict, bound, metric):
     # Total # of model evaluations will be N (2*NV+2), where NV is number of variables (given NV>1)
     params = sobol_sample.sample(problem, 1024, calc_second_order=True) 
 
+    # Keep track of the elapsed time of the program 
+    startTime = time.time()
+
     p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric)
 
+    np.save("./raw_outputs.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
+    print("Raw outputs saved.")
+
+    elapsedTime = time.time() - startTime
+    mins, secs = divmod(elapsedTime, 60)
+
+    print(f"It took {int(mins)} minutes and {secs:.1f} seconds to evaluate the model. ({elapsedTime} seconds total)")
+
+    # only save non-null rows, otherwise omit 
     valid_rows = ~(np.isnan(p_maxs) | np.isnan(EDV) | np.isnan(ESV) | np.isnan(stroke) | np.isnan(EF))
-    clean_p_maxs = p_maxs[valid_rows]
-    clean_EDV = EDV[valid_rows]
-    clean_ESV = ESV[valid_rows]
-    clean_stroke = stroke[valid_rows]
-    clean_EF = EF[valid_rows]
+    # clean_p_maxs = p_maxs[valid_rows]
+    # clean_EDV = EDV[valid_rows]
+    # clean_ESV = ESV[valid_rows]
+    # clean_stroke = stroke[valid_rows]
+    # clean_EF = EF[valid_rows]
 
 
+    # Quantify how many rows contained NaN values - used to help determine whether enough valid results were quantified
     failure_rate = (~valid_rows).sum() / len(valid_rows)
     print(f"Failure rate: {failure_rate}")
 
@@ -355,14 +369,19 @@ def sobol_sensitivity(data, param_dict, bound, metric):
         print("WARNING: Failure rate > 0.05. Sensitivity indices may be unreliable.")
 
 
+    for arr in [p_maxs, EDV, ESV, stroke, EF]:
+        nanMask = np.isnan(arr) # indicate which rows/values of the array are NaN (boolean mask: true if NaN)
+        if nanMask.any():
+            arr[nanMask] = np.nanmedian(arr) # for all rows that are nan replace nan value with median of all valid rows
+
     # Provides insight into how much each parameter contributes to output variance
     # Essentially the actual evaluation step where the sobol variance-based
     # sensitivty analysis formula described in Stelli is evaluated.
-    Si_p_maxs = sobol.analyze(problem, clean_p_maxs, calc_second_order=True, print_to_console=True)
-    Si_EDV = sobol.analyze(problem, clean_EDV, calc_second_order=True, print_to_console=True)
-    Si_ESV = sobol.analyze(problem, clean_ESV, calc_second_order=True, print_to_console=True)
-    Si_stroke = sobol.analyze(problem, clean_stroke, calc_second_order=True, print_to_console=True)
-    Si_EF = sobol.analyze(problem, clean_EF, calc_second_order=True, print_to_console=True)
+    Si_p_maxs = sobol.analyze(problem, p_maxs, calc_second_order=True, print_to_console=True)
+    Si_EDV = sobol.analyze(problem, EDV, calc_second_order=True, print_to_console=True)
+    Si_ESV = sobol.analyze(problem, ESV, calc_second_order=True, print_to_console=True)
+    Si_stroke = sobol.analyze(problem, stroke, calc_second_order=True, print_to_console=True)
+    Si_EF = sobol.analyze(problem, EF, calc_second_order=True, print_to_console=True)
     
     return Si_p_maxs, Si_EDV, Si_ESV, Si_stroke, Si_EF, problem["outputs"]
 
@@ -486,7 +505,7 @@ Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_base
 LV_SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
 
 # np.save("./LV_SIs",LV_SIs)
-np.save("./LV_SIs_1024",LV_SIs)
+np.save("./LV_SIs_1024_5/18/2026",LV_SIs)
 #LV_SIs = np.load("./LV_SIs.npy", allow_pickle=True)
 
 SA_heatmap(LV_SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
