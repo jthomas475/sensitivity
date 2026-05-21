@@ -7,6 +7,7 @@ import pysvzerod as zerod
 import json
 import copy
 import time
+import os
 
 from SALib.sample import sobol as sobol_sample
 from SALib.analyze import sobol
@@ -20,6 +21,17 @@ def read_file(myfile):
     with open(myfile, "r") as file:
         data = json.load(file)
     return data
+
+def safe_save(path, data):
+    if not path.endswith(".npy"):
+        path = path + ".npy"
+
+    if os.path.exists(path):
+        raise FileExistsError(f"File '{path}' already exists. Update file name to avoid overwriting data")
+    
+    np.save(path, data)
+    print(f"Succesfully saved path to '{path}'")
+
 
 # Returns the 0D element values of ChamberSphere, Upstream_vessel, and 
 # Downstream_vessel 0D element types/names given data from a parsed
@@ -92,7 +104,7 @@ def get_v_metric(data, metric):
 
     LV_radius = get_radius(data)
 
-    vol = np.array(results[results.name == "volume:ventricle"].y) + (4/3)*np.pi*LV_radius**3 # need to fix - volume is volume change (calculate baseline volume)
+    vol = np.array(results[results.name == "volume:ventricle"].y) + (4/3)*np.pi*LV_radius**3 # note that volume:ventricle is the change in volume, so need to add to "baseline" volume that's calculated via radius
     time = np.array(results[results.name == "volume:ventricle"].time)
 
     if(metric == "max"):
@@ -296,7 +308,7 @@ def evaluate_model(data, params, param_map, metric):
 
 
         except RuntimeError as e:
-            print(f"Failure numer: {failures}")
+            print(f"Failure number: {failures}")
             print(f"Simulation failed at index {i}")
             print("Parameters used:")
             for ves, param, scaler in failed_params:
@@ -336,14 +348,14 @@ def sobol_sensitivity(data, param_dict, bound, metric):
     # double or quadurple sample size). Want to keep sample size power of 2
     # This step generates the set of model inputs
     # Total # of model evaluations will be N (2*NV+2), where NV is number of variables (given NV>1)
-    params = sobol_sample.sample(problem, 1024, calc_second_order=True) 
+    params = sobol_sample.sample(problem, 128, calc_second_order=True) 
 
     # Keep track of the elapsed time of the program 
     startTime = time.time()
 
     p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric)
 
-    np.save("./raw_outputs.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
+    safe_save("./RawOutputs/raw_outputs_5_21_2026_samplesize16_bound0.4.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
     print("Raw outputs saved.")
 
     elapsedTime = time.time() - startTime
@@ -376,7 +388,7 @@ def sobol_sensitivity(data, param_dict, bound, metric):
 
     # Provides insight into how much each parameter contributes to output variance
     # Essentially the actual evaluation step where the sobol variance-based
-    # sensitivty analysis formula described in Stelli is evaluated.
+    # sensitivty analysis formula described in Satelli is evaluated.
     Si_p_maxs = sobol.analyze(problem, p_maxs, calc_second_order=True, print_to_console=True)
     Si_EDV = sobol.analyze(problem, EDV, calc_second_order=True, print_to_console=True)
     Si_ESV = sobol.analyze(problem, ESV, calc_second_order=True, print_to_console=True)
@@ -386,9 +398,9 @@ def sobol_sensitivity(data, param_dict, bound, metric):
     return Si_p_maxs, Si_EDV, Si_ESV, Si_stroke, Si_EF, problem["outputs"]
 
 
-####################
-# Heatmap Function #
-####################
+#####################
+# Heatmap Functions #
+#####################
 def s2_heatmap(Si, param_dict):
     param_indicators, param_map = create_indicators(param_dict)
 
@@ -471,28 +483,7 @@ LV_baseline_input = read_file(LV_fname)
 LV_baseline_input["simulation_parameters"]["output_all_cycles"] = False
 
 
-
-# Caruel_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity/chamber_sphere_Caruel.json"
-
-# Caruel_baseline_input = read_file(Caruel_fname)
-# Caruel_baseline_input["simulation_parameters"]["number_of_cardiac_cycles"] = 2
-# Caruel_baseline_input["simulation_parameters"]["output_all_cycles"] = False
-
-# pdb.set_trace() # review documentation (placed here in order to analyze baseline_
-                #results.name)
-
-bound = [0.8,1.2]
-# LV_problem = {
-#     'num_vars': 4, 
-#     'names': ['Up_res', "Down_res", "Up_cap", 'Down_cap'],
-#     'bounds': [[0.8, 1.2]]*4 # note these are arbitrarily chosen, not physically grounded - not sure if the range is too small
-# }
-
-# Caruel_problem = {
-#     'num_vars': 6, 
-#     'names': ['Up_res', "Down_prox_res","Down_dist_res", "Up_cap", 'Down_prox_cap',"Down_dist_cap"],
-#     'bounds': [[0.8, 1.2]]*6
-# }
+bound = [0.6,1.4]
 
 LV_dict = create_dict(LV_baseline_input)
 
@@ -500,13 +491,51 @@ LV_dict = create_dict(LV_baseline_input)
 
 Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max")
 
-# #Si_Caruel = sobol_sensitivity(Caruel_baseline_input, Caruel_dict, bound, "max")
+
+
+# ###############################
+# # Data Load (if errors occur) #
+# ###############################
+
+# # Load raw inputs, given errors or failures. 
+# raw = np.load("./raw_outputs.npy")
+# print(raw.shape)
+
+# p_maxs, EDV, ESV, stroke, EF = raw[0], raw[1], raw[2], raw[3], raw[4]
+
+# for arr in [p_maxs, EDV, ESV, stroke, EF]:
+#     nan_mask = np.isnan(arr)
+#     if nan_mask.any():
+#         arr[nan_mask] = np.nanmedian(arr)
+
+
+# param_indicators, param_map = create_indicators(LV_dict)
+# num_vars = len(param_indicators)
+
+# problem = {
+#     'num_vars': num_vars,
+#     'names': param_indicators,
+#     'bounds': [bound] * num_vars,
+#     'outputs': ["p_maxs", "EDV", "ESV", "stroke", "EF"]
+# }
+
+# # run sobol analysis on the correctly-sized arrays
+# Si_y = sobol.analyze(problem, p_maxs, calc_second_order=True, print_to_console=True)
+# Si_EDV = sobol.analyze(problem, EDV, calc_second_order=True, print_to_console=True)
+# Si_ESV = sobol.analyze(problem, ESV, calc_second_order=True, print_to_console=True)
+# Si_stroke = sobol.analyze(problem, stroke, calc_second_order=True, print_to_console=True)
+# Si_EF = sobol.analyze(problem, EF, calc_second_order=True, print_to_console=True)
+
+# output_names = problem["outputs"]
+
+# #################
+# # END Data Load #
+# #################
+
 
 LV_SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
 
-# np.save("./LV_SIs",LV_SIs)
-np.save("./LV_SIs_1024_5/18/2026",LV_SIs)
-#LV_SIs = np.load("./LV_SIs.npy", allow_pickle=True)
+safe_save("./Results/LV_SIs_5_21_2026_samplesize16_bound0.4",LV_SIs)
 
 SA_heatmap(LV_SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
 # # print(f"S2 values:\n {Si_LV[S2]}")
