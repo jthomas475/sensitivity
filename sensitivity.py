@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import numpy as np
+import pandas as pd
 import pdb
 import matplotlib.pyplot as plt
 import pysvzerod as zerod
@@ -32,7 +33,6 @@ def safe_save(path, data):
     np.save(path, data)
     print(f"Succesfully saved path to '{path}'")
 
-
 # Returns the 0D element values of ChamberSphere, Upstream_vessel, and 
 # Downstream_vessel 0D element types/names given data from a parsed
 # file read using read_file function given above 
@@ -55,6 +55,47 @@ def get_chamber_params(data):
 
     return params, down_vals, up_vals
 
+
+
+def get_closed_loop_params(data):
+    vessels = data[vessels]
+
+    expmat_vals = None
+    aorta_vals = None
+    arteries_vals = None
+    arterioles_vals = None
+    caps_vals = None
+    venueles_vals = None
+    veins_vals = None
+
+    
+
+    for ves in vessels:
+        if (ves["vessel_name"] == "LV"):
+            expmat_vals = ves["zero_d_element_values"]
+
+        elif (ves["vessel_name"] == "aorta"):
+            aorta_vals = ves["zero_d_element_values"]
+
+        elif (ves["vessel_name"] == "arteries"):
+            arteries_vals = ves["zero_d_element_values"]
+        
+        elif (ves["vessel_name"] == "arterioles"):
+            arterioles_vals = ves["zero_d_element_values"]
+
+        elif (ves["vessel_name"] == "capillaries"):
+            caps_vals = ves["zero_d_element_values"]
+        
+        elif (ves["vessel_name"] == "venules"):
+            venueles_vals = ves["zero_d_element_values"]
+
+        elif (ves["vessel_name"] == "veins"):
+            veins_vals = ves["zero_d_element_values"]
+
+    return expmat_vals, aorta_vals, arteries_vals, arterioles_vals, caps_vals, venueles_vals, veins_vals
+
+
+
 # Returns the resistance value of the given vessel name, if possible
 # Otherwise returns error
 def get_res(data, ves_name):
@@ -76,10 +117,12 @@ def change_res(data, scaler, ves_name):
         if ves["vessel_name"] == ves_name:
             ves["zero_d_element_values"]["R_poiseuille"] = perturbed_res
 
-def get_p_metric(data, metric):
+def get_p_metric(data, metric, model="open"):
     results = zerod.simulate(data)
+    name = "pressure:outlet_valve:downstream_vessel" if model == "open" else "pressure:LV:AV"
+
     # pressure = np.array(results[results.name == "pressure:outlet_valve:downstream_proximal_vessel"].y) # Accesses Caruel Pressure for proximal vessel
-    pressure = np.array(results[results.name == "pressure:outlet_valve:downstream_vessel"].y) # Accesses LV Pressure 
+    pressure = np.array(results[results.name == name].y) # Accesses LV Pressure 
 
     if(metric == "max"):
         p_max = np.max(pressure)
@@ -99,13 +142,15 @@ def get_radius(data):
         if ves["zero_d_element_type"]=="ChamberSphere":
             return ves["zero_d_element_values"]["radius0"]
 
-def get_v_metric(data, metric):
+def get_v_metric(data, metric, model="open"):
     results = zerod.simulate(data)
 
     LV_radius = get_radius(data)
 
-    vol = np.array(results[results.name == "volume:ventricle"].y) + (4/3)*np.pi*LV_radius**3 # note that volume:ventricle is the change in volume, so need to add to "baseline" volume that's calculated via radius
-    time = np.array(results[results.name == "volume:ventricle"].time)
+    name = "volume:ventricle" if model == "open" else "volume:LV"
+
+    vol = np.array(results[results.name == name].y) + (4/3)*np.pi*LV_radius**3 if model == "open" else np.array(results[results.name == name].y) # note that volume:ventricle is the change in volume, so need to add to "baseline" volume that's calculated via radius
+    time = np.array(results[results.name == name].time)
 
     if(metric == "max"):
         v_max = np.max(vol)
@@ -121,9 +166,12 @@ def get_v_metric(data, metric):
 
 
 
-def get_f_metric(data, metric):
+def get_f_metric(data, metric, model="open"):
     results = zerod.simulate(data)
-    flow = np.array(results[results.name == "flow:outlet_valve:downstream_vessel"].y) # Accesses LV Pressure
+
+    name = "flow:outlet_valve:downstream_vessel" if model == "open" else "flow:LV:AV"
+
+    flow = np.array(results[results.name == name].y) # Accesses LV Pressure
     if(metric == "max"):
         f_max = np.max(flow)
         return f_max
@@ -140,10 +188,10 @@ def get_f_metric(data, metric):
 # End-systolic volume (ESV) is x% of the max volume (about 30%-40% max volume)
 # stroke volume is EDV-ESV
 # Ejection fraction is stroke Volume / EDV * 100
-def get_outputs(data):
-    EDV = get_v_metric(data,"max")
+def get_outputs(data,model="open"):
+    EDV = get_v_metric(data,"max",model)
 
-    ESV = get_v_metric(data,"min")
+    ESV = get_v_metric(data,"min",model)
 
     stroke = EDV-ESV
 
@@ -275,7 +323,7 @@ def create_indicators(param_dict):
 
 # Parameters:
 # 
-def evaluate_model(data, params, param_map, metric):
+def evaluate_model(data, params, param_map, metric, model="open"):
     p_maxs, EDV, ESV, stroke, EF = [np.full(len(params), np.nan) for _ in range(5)]
     failures = 1
 
@@ -303,8 +351,8 @@ def evaluate_model(data, params, param_map, metric):
                         valve["params"][param] *= scaler
 
         try:
-            p_maxs[i] = get_p_metric(perturbed_data, metric)
-            EDV[i], ESV[i], stroke[i], EF[i] = get_outputs(perturbed_data)
+            p_maxs[i] = get_p_metric(perturbed_data, metric,model)
+            EDV[i], ESV[i], stroke[i], EF[i] = get_outputs(perturbed_data,model)
 
 
         except RuntimeError as e:
@@ -332,7 +380,7 @@ def evaluate_model(data, params, param_map, metric):
 
 #Instead of providing an array of strings containing parameter names/acronyms,
 # establish a dictionary called param_dict  
-def sobol_sensitivity(data, param_dict, bound, metric):    
+def sobol_sensitivity(data, param_dict, bound, metric, model):    
     param_indicators, param_map = create_indicators(param_dict)
 
     num_vars = len(param_indicators)
@@ -348,14 +396,14 @@ def sobol_sensitivity(data, param_dict, bound, metric):
     # double or quadurple sample size). Want to keep sample size power of 2
     # This step generates the set of model inputs
     # Total # of model evaluations will be N (2*NV+2), where NV is number of variables (given NV>1)
-    params = sobol_sample.sample(problem, 128, calc_second_order=True) 
+    params = sobol_sample.sample(problem, 16, calc_second_order=True) 
 
     # Keep track of the elapsed time of the program 
     startTime = time.time()
 
-    p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric)
+    p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric, model)
 
-    safe_save("./RawOutputs/raw_outputs_5_21_2026_samplesize16_bound0.4.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
+    safe_save("./RawOutputs/raw_outputs_6_2_2026_closedloop_samplesize16_bound0.4_test1.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
     print("Raw outputs saved.")
 
     elapsedTime = time.time() - startTime
@@ -432,7 +480,7 @@ def SA_heatmap(Si_s, names, param_dict):
     mymap = []
 
     for sobol_idx in indices:
-        for i, Si in enumerate(Si_s):
+        for Si in Si_s:
             Si_index_matrix = np.array(Si[sobol_idx]) # an array containing all the sobol values for given sobol_idx
 
             Si_index_matrix[Si_index_matrix < 0] = 0
@@ -477,66 +525,72 @@ def SA_heatmap(Si_s, names, param_dict):
 
 
 LV_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity/chamber_sphere.json"
+CL_fname = LV_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity/chamber_sphere_closed_loop.json"
+
+svZeroDSolver_path = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/svZeroDSolver-jt/build/svzerodsolver"
+
 
 LV_baseline_input = read_file(LV_fname)
-# LV_baseline_input["simulation_parameters"]["number_of_cardiac_cycles"] = 2
-LV_baseline_input["simulation_parameters"]["output_all_cycles"] = False
+CL_baseline_input = read_file(CL_fname)
 
 
-bound = [0.6,1.4]
+bound = [0.6,1.4] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
 
-LV_dict = create_dict(LV_baseline_input)
-
-# Caruel_dict = create_dict(Caruel_baseline_input)
-
-Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max")
+LV_dict = create_dict(LV_baseline_input) # dictionary for (open) chamber sphere
+CL_dict = create_dict(CL_baseline_input)  # dictionary for closed loop chamber sphere 
 
 
-
-# ###############################
-# # Data Load (if errors occur) #
-# ###############################
-
-# # Load raw inputs, given errors or failures. 
-# raw = np.load("./raw_outputs.npy")
-# print(raw.shape)
-
-# p_maxs, EDV, ESV, stroke, EF = raw[0], raw[1], raw[2], raw[3], raw[4]
-
-# for arr in [p_maxs, EDV, ESV, stroke, EF]:
-#     nan_mask = np.isnan(arr)
-#     if nan_mask.any():
-#         arr[nan_mask] = np.nanmedian(arr)
+# # Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open")
+Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed")
 
 
-# param_indicators, param_map = create_indicators(LV_dict)
-# num_vars = len(param_indicators)
+# # ###############################
+# # # Data Load (if errors occur) #
+# # ###############################
 
-# problem = {
-#     'num_vars': num_vars,
-#     'names': param_indicators,
-#     'bounds': [bound] * num_vars,
-#     'outputs': ["p_maxs", "EDV", "ESV", "stroke", "EF"]
-# }
+# # # Load raw inputs, given errors or failures. 
+# # raw = np.load("./raw_outputs.npy")
+# # print(raw.shape)
 
-# # run sobol analysis on the correctly-sized arrays
-# Si_y = sobol.analyze(problem, p_maxs, calc_second_order=True, print_to_console=True)
-# Si_EDV = sobol.analyze(problem, EDV, calc_second_order=True, print_to_console=True)
-# Si_ESV = sobol.analyze(problem, ESV, calc_second_order=True, print_to_console=True)
-# Si_stroke = sobol.analyze(problem, stroke, calc_second_order=True, print_to_console=True)
-# Si_EF = sobol.analyze(problem, EF, calc_second_order=True, print_to_console=True)
+# # p_maxs, EDV, ESV, stroke, EF = raw[0], raw[1], raw[2], raw[3], raw[4]
 
-# output_names = problem["outputs"]
-
-# #################
-# # END Data Load #
-# #################
+# # for arr in [p_maxs, EDV, ESV, stroke, EF]:
+# #     nan_mask = np.isnan(arr)
+# #     if nan_mask.any():
+# #         arr[nan_mask] = np.nanmedian(arr)
 
 
-LV_SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
+# # param_indicators, param_map = create_indicators(LV_dict)
+# # num_vars = len(param_indicators)
 
-safe_save("./Results/LV_SIs_5_21_2026_samplesize16_bound0.4",LV_SIs)
+# # problem = {
+# #     'num_vars': num_vars,
+# #     'names': param_indicators,
+# #     'bounds': [bound] * num_vars,
+# #     'outputs': ["p_maxs", "EDV", "ESV", "stroke", "EF"]
+# # }
 
-SA_heatmap(LV_SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
+# # # run sobol analysis on the correctly-sized arrays
+# # Si_y = sobol.analyze(problem, p_maxs, calc_second_order=True, print_to_console=True)
+# # Si_EDV = sobol.analyze(problem, EDV, calc_second_order=True, print_to_console=True)
+# # Si_ESV = sobol.analyze(problem, ESV, calc_second_order=True, print_to_console=True)
+# # Si_stroke = sobol.analyze(problem, stroke, calc_second_order=True, print_to_console=True)
+# # Si_EF = sobol.analyze(problem, EF, calc_second_order=True, print_to_console=True)
+
+# # output_names = problem["outputs"]
+
+# # #################
+# # # END Data Load #
+# # #################
+
+
+SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
+
+safe_save("./Results/SIs_6_2_2026_closedloop_samplesize16_bound0.4_test1", SIs)
+
+SA_heatmap(SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
 # # print(f"S2 values:\n {Si_LV[S2]}")
+
+# # checking to see if zerod solver is from a compiled native extension library or my locally built executable
+# print(f"{zerod.__file__}\n")
 
