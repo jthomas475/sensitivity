@@ -55,8 +55,6 @@ def get_chamber_params(data):
 
     return params, down_vals, up_vals
 
-
-
 def get_closed_loop_params(data):
     vessels = data[vessels]
 
@@ -67,8 +65,6 @@ def get_closed_loop_params(data):
     caps_vals = None
     venueles_vals = None
     veins_vals = None
-
-    
 
     for ves in vessels:
         if (ves["vessel_name"] == "LV"):
@@ -94,47 +90,14 @@ def get_closed_loop_params(data):
 
     return expmat_vals, aorta_vals, arteries_vals, arterioles_vals, caps_vals, venueles_vals, veins_vals
 
-
-
-# Returns the resistance value of the given vessel name, if possible
-# Otherwise returns error
-def get_res(data, ves_name):
-    for ves in data["vessels"]:
-
-        if ves["vessel_name"] == ves_name:
-            vals = ves["zero_d_element_values"]
-
-            if "R_poiseuille" in vals:
-                return vals["R_poiseuille"]
-            else:
-               raise LookupError("Error: Given vessel type does not contain resistance parameter")
-            
-    raise LookupError(f"Vessel '{ves_name}' not found in data.")
-
-def change_res(data, scaler, ves_name):
-    perturbed_res = scaler*get_res(data, ves_name)
-    for ves in data["vessels"]:
-        if ves["vessel_name"] == ves_name:
-            ves["zero_d_element_values"]["R_poiseuille"] = perturbed_res
-
-def get_p_metric(data, metric, model="open"):
-    results = zerod.simulate(data)
-    name = "pressure:outlet_valve:downstream_vessel" if model == "open" else "pressure:LV:AV"
-
-    # pressure = np.array(results[results.name == "pressure:outlet_valve:downstream_proximal_vessel"].y) # Accesses Caruel Pressure for proximal vessel
-    pressure = np.array(results[results.name == name].y) # Accesses LV Pressure 
-
-    if(metric == "max"):
-        p_max = np.max(pressure)
-        return p_max
-    
-    elif(metric == "min"):
-        p_min = np.min(pressure)
-        return p_min
-    
-    elif(metric == "mean"):
-        p_mean = np.mean(pressure)
-        return p_mean
+# Obtain the y-value for a given variable/name of the model
+# Runtime error is raised if variable is not found, which is recorded as a failure
+# instead of crashing when empty array observed.
+def extract_val(results, name):
+    y = np.array(results[results.name == name].y)
+    if y.size == 0:
+        raise RuntimeError(f"No '{name}' rows in results (solve diverged or variable absent)")
+    return y
     
 
 def get_radius(data):
@@ -142,129 +105,38 @@ def get_radius(data):
         if ves["zero_d_element_type"]=="ChamberSphere":
             return ves["zero_d_element_values"]["radius0"]
 
-def get_v_metric(data, metric, model="open"):
-    results = zerod.simulate(data)
-
-    LV_radius = get_radius(data)
-
-    name = "volume:ventricle" if model == "open" else "volume:LV"
-
-    vol = np.array(results[results.name == name].y) + (4/3)*np.pi*LV_radius**3 if model == "open" else np.array(results[results.name == name].y) # note that volume:ventricle is the change in volume, so need to add to "baseline" volume that's calculated via radius
-    time = np.array(results[results.name == name].time)
-
-    if(metric == "max"):
-        v_max = np.max(vol)
-        return v_max
-    
-    elif(metric == "min"):
-        v_min = np.min(vol)
-        return v_min
-    
-    elif(metric == "mean"):
-        v_mean = np.mean(vol)
-        return v_mean
-
-
-
-def get_f_metric(data, metric, model="open"):
-    results = zerod.simulate(data)
-
-    name = "flow:outlet_valve:downstream_vessel" if model == "open" else "flow:LV:AV"
-
-    flow = np.array(results[results.name == name].y) # Accesses LV Pressure
-    if(metric == "max"):
-        f_max = np.max(flow)
-        return f_max
-    
-    elif(metric == "min"):
-        f_min = np.min(flow)
-        return f_min
-    
-    elif(metric == "mean"):
-        f_mean = np.mean(flow)
-        return f_mean
-
 # Note that end-diastolic volume (EDV) is 100% of the max volume (so just max volume)
-# End-systolic volume (ESV) is x% of the max volume (about 30%-40% max volume)
-# stroke volume is EDV-ESV
-# Ejection fraction is stroke Volume / EDV * 100
-def get_outputs(data,model="open"):
-    EDV = get_v_metric(data,"max",model)
+# End-systolic volume (ESV) is x% of the max volume (about 30%-40% max volume) - just defaulted to obtaining the min vol value
+# stroke volume is the difference between EDV and ESV. Formally, EDV-ESV
+# Ejection fraction (EF) is stroke Volume / EDV * 100
+# Evaluate sample once as opposed to three times to improve SA efficiency
+def evaluate_sample(data, metric, model="open"):
+    results = zerod.simulate(data)
 
-    ESV = get_v_metric(data,"min",model)
+    p_name = "pressure:outlet_valve:downstream_vessel" if model == "open" else "pressure:LV:AV"
+    v_name = "volume:ventricle" if model == "open" else "volume:LV"
 
-    stroke = EDV-ESV
+    pressure = extract_val(results, p_name)
+    if metric == "max":
+        p_metric = np.max(pressure)
+    elif metric == "min":
+        p_metric = np.min(pressure)
+    elif metric == "mean":
+        p_metric = np.mean(pressure)
+    else:
+        raise ValueError(f"Unknown metric '{metric}'")
 
-    EF = stroke/EDV *100
+    vol = extract_val(results, v_name)
+    if model == "open":
+        # volume:ventricle is the change in volume, so add the baseline sphere volume
+        vol = vol + (4/3)*np.pi*get_radius(data)**3
 
-    return EDV, ESV, stroke, EF
+    EDV = np.max(vol)
+    ESV = np.min(vol)
+    stroke = EDV - ESV
+    EF = stroke / EDV * 100
 
-
-
-def create_pmax_res_graph(data, ves_name, num_pts):
-    if(num_pts<=2):
-        raise ValueError("Need at least 3 points for array")
-
-    scalers = np.linspace(0.5, 2, num_pts)
-
-    resistances = np.zeros(num_pts)
-    p_max_values = np.zeros(num_pts)
-    p_mean_values = np.zeros(num_pts)
-
-
-    for i in range(num_pts):
-        perturbed_data = copy.deepcopy(data)
-        change_res(perturbed_data, scalers[i], ves_name)
-        resistances[i] = get_res(perturbed_data, ves_name)
-
-        p_max_values[i] = get_p_metric(perturbed_data,"max")
-        p_mean_values[i] = get_p_metric(perturbed_data,"mean")
-
-        
-
-    
-    plt.plot(resistances, p_max_values, label = "Max pressures")
-    plt.plot(resistances, p_mean_values, label = "Mean pressures")
-
-    plt.title(f"Pressure metrics vs Resistances ({ves_name})")
-    plt.xlabel("Resistance")
-    plt.ylabel("Pressure")
-    plt.legend()
-    plt.show()
-
-    unperturbed_res = get_res(data, ves_name)
-    print(f"- Baseline resistance:\n\t{unperturbed_res}\n")
-    print(f"- Baseline max pressure:\n\t{get_p_metric(data, 'max')}\n")
-    print(f"- Baseline mean pressure:\n\t{get_p_metric(data, 'mean')}\n")
-    
-    print(f"- Resistances computed:\n\t{resistances}\n")
-    print(f"- Max pressures computed:\n\t{p_max_values}\n")
-    print(f"- Mean pressures computed:\n\t{p_mean_values}\n")
-    
-    
-    # Statisitics
-    print(f"- Standard deviation of max pressure values:\n\t{np.std(p_max_values)}\n")
-    print(f"- Standard deviation of mean pressure values:\n\t{np.std(p_mean_values)}\n")
-
-
-    p_max_res_sens = np.gradient(p_max_values, resistances)
-    norm_p_max_res_sens = (p_max_res_sens*resistances)/p_max_values
-    print(f"- Normalized sensitivty (max pressure, resistance):\n\t{norm_p_max_res_sens}\n")
-
-    p_mean_res_sens = np.gradient(p_mean_values, resistances)
-    norm_p_mean_res_sens = (p_mean_res_sens*resistances)/p_mean_values
-    print(f"- Normalized sensitivty (mean pressure, resistance):\n\t{norm_p_mean_res_sens}\n")
-
-
-
-def change_cap(data, scaler, ves_name):
-    for ves in data["vessels"]:
-        if ves["vessel_name"] == ves_name:
-            vals = ves["zero_d_element_values"]
-
-            if "C" in vals:
-                vals["C"] *= scaler
-
+    return p_metric, EDV, ESV, stroke, EF
 
 def create_dict(json_file):
     param_dict = {}
@@ -321,8 +193,7 @@ def create_indicators(param_dict):
 # Below are the SALib-based functions
 ####
 
-# Parameters:
-# 
+
 def evaluate_model(data, params, param_map, metric, model="open"):
     p_maxs, EDV, ESV, stroke, EF = [np.full(len(params), np.nan) for _ in range(5)]
     failures = 1
@@ -351,11 +222,10 @@ def evaluate_model(data, params, param_map, metric, model="open"):
                         valve["params"][param] *= scaler
 
         try:
-            p_maxs[i] = get_p_metric(perturbed_data, metric,model)
-            EDV[i], ESV[i], stroke[i], EF[i] = get_outputs(perturbed_data,model)
+            p_maxs[i], EDV[i], ESV[i], stroke[i], EF[i] = evaluate_sample(perturbed_data, metric, model)
 
 
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"Failure number: {failures}")
             print(f"Simulation failed at index {i}")
             print("Parameters used:")
@@ -403,8 +273,8 @@ def sobol_sensitivity(data, param_dict, bound, metric, model):
 
     p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric, model)
 
-    safe_save("./RawOutputs/raw_outputs_6_2_2026_closedloop_samplesize16_bound0.4_test1.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
-    print("Raw outputs saved.")
+    # safe_save("./RawOutputs/raw_outputs_6_2_2026_closedloop_samplesize16_bound0.4_test1.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
+    # print("Raw outputs saved.")
 
     elapsedTime = time.time() - startTime
     mins, secs = divmod(elapsedTime, 60)
@@ -534,14 +404,14 @@ LV_baseline_input = read_file(LV_fname)
 CL_baseline_input = read_file(CL_fname)
 
 
-bound = [0.6,1.4] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
+bound = [0.8,1.2] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
 
 LV_dict = create_dict(LV_baseline_input) # dictionary for (open) chamber sphere
 CL_dict = create_dict(CL_baseline_input)  # dictionary for closed loop chamber sphere 
 
 
-# # Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open")
-Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed")
+Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open")
+# Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed")
 
 
 # # ###############################
@@ -586,7 +456,7 @@ Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_base
 
 SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
 
-safe_save("./Results/SIs_6_2_2026_closedloop_samplesize16_bound0.4_test1", SIs)
+# safe_save("./Results/SIs_6_2_2026_closedloop_samplesize16_bound0.4_test1", SIs)
 
 SA_heatmap(SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
 # # print(f"S2 values:\n {Si_LV[S2]}")
