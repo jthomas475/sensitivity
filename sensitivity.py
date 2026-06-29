@@ -9,6 +9,10 @@ import json
 import copy
 import time
 import os
+from joblib import Parallel, delayed
+from contextlib import contextmanager
+from tqdm import tqdm
+
 
 from SALib.sample import sobol as sobol_sample
 from SALib.analyze import sobol
@@ -105,38 +109,7 @@ def get_radius(data):
         if ves["zero_d_element_type"]=="ChamberSphere":
             return ves["zero_d_element_values"]["radius0"]
 
-# Note that end-diastolic volume (EDV) is 100% of the max volume (so just max volume)
-# End-systolic volume (ESV) is x% of the max volume (about 30%-40% max volume) - just defaulted to obtaining the min vol value
-# stroke volume is the difference between EDV and ESV. Formally, EDV-ESV
-# Ejection fraction (EF) is stroke Volume / EDV * 100
-# Evaluate sample once as opposed to three times to improve SA efficiency
-def evaluate_sample(data, metric, model="open"):
-    results = zerod.simulate(data)
 
-    p_name = "pressure:outlet_valve:downstream_vessel" if model == "open" else "pressure:LV:AV"
-    v_name = "volume:ventricle" if model == "open" else "volume:LV"
-
-    pressure = extract_val(results, p_name)
-    if metric == "max":
-        p_metric = np.max(pressure)
-    elif metric == "min":
-        p_metric = np.min(pressure)
-    elif metric == "mean":
-        p_metric = np.mean(pressure)
-    else:
-        raise ValueError(f"Unknown metric '{metric}'")
-
-    vol = extract_val(results, v_name)
-    if model == "open":
-        # volume:ventricle is the change in volume, so add the baseline sphere volume
-        vol = vol + (4/3)*np.pi*get_radius(data)**3
-
-    EDV = np.max(vol)
-    ESV = np.min(vol)
-    stroke = EDV - ESV
-    EF = stroke / EDV * 100
-
-    return p_metric, EDV, ESV, stroke, EF
 
 def create_dict(json_file):
     param_dict = {}
@@ -188,10 +161,111 @@ def create_indicators(param_dict):
 
 
     return param_indicators, param_map
-    
+
+
+#Contextmanager implementation to implement verbose/quiet toggle
+# Utilize that every running program has file descriptors, with
+# 0 representing stdin, 1 stdout, 2 stdin
+@contextmanager
+def quiet_func():
+    devnull = os.open(os.devnull, os.O_WRONLY) # open null device and write only
+    saved = os.dup(1) # save current stdout to record where stdout is written if 1 file pipeline disrupted
+    os.dup2(devnull,1) # make 1 (stdout) point to wherever devnull points
+    try:
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved) # close the temp descriptor and null point
+        os.close(devnull)
+
 ####
 # Below are the SALib-based functions
 ####
+
+
+def evaluate_single(data, params_row, param_map, metric, model):
+    perturbed_data = copy.deepcopy(data)
+
+    for i, X in enumerate(param_map):
+        ves = X["name"]
+        param = X["param"]
+        scaler = params_row[i]
+
+        if X["type"] == "vessel":
+            for vessel in perturbed_data["vessels"]:
+                if vessel["vessel_name"]== ves:
+                    vessel["zero_d_element_values"][param] *= scaler
+        
+        elif X["type"] == "valve":
+            for valve in perturbed_data["valves"]:
+                if valve['names']== ves:
+                    valve["zero_d_element_values"][param] *= scaler
+    
+    try:
+        return evaluate_sample(perturbed_data, metric, model), None
+
+    except (RuntimeError, ValueError) as e:
+        return (np.nan, np.nan, np.nan, np.nan, np.nan), str(e)
+
+
+
+# Note that end-diastolic volume (EDV) is 100% of the max volume (so just max volume)
+# End-systolic volume (ESV) is x% of the max volume (about 30%-40% max volume) - just defaulted to obtaining the min vol value
+# stroke volume is the difference between EDV and ESV. Formally, EDV-ESV
+# Ejection fraction (EF) is stroke Volume / EDV * 100
+# Evaluate sample once as opposed to three times to improve SA efficiency
+def evaluate_sample(data, metric, model="open"):
+    with quiet_func():
+        results = zerod.simulate(data)
+
+    p_name = "pressure:outlet_valve:downstream_vessel" if model == "open" else "pressure:LV:AV"
+    v_name = "volume:ventricle" if model == "open" else "volume:LV"
+
+    pressure = extract_val(results, p_name)
+    if metric == "max":
+        p_metric = np.max(pressure)
+    elif metric == "min":
+        p_metric = np.min(pressure)
+    elif metric == "mean":
+        p_metric = np.mean(pressure)
+    else:
+        raise ValueError(f"Unknown metric '{metric}'")
+
+    vol = extract_val(results, v_name)
+    if model == "open":
+        # volume:ventricle is the change in volume, so add the baseline sphere volume
+        vol = vol + (4/3)*np.pi*get_radius(data)**3
+
+    EDV = np.max(vol)
+    ESV = np.min(vol)
+    stroke = EDV - ESV
+    EF = stroke / EDV * 100
+
+    return p_metric, EDV, ESV, stroke, EF
+
+
+# running parallel with n_jobs and default backend module "loky" to "start separate Python worker processes to execute tasks concurrently on separate CPUs." 
+def evaluate_model_parallel(data, params, param_map, metric, model="open", n_jobs=1):
+    p_maxs, EDV, ESV, stroke, EF = [np.full(len(params), np.nan) for _ in range(5)]
+    failures = 0
+
+    results = Parallel(n_jobs=n_jobs, return_as = "generator")(
+        delayed(evaluate_single)(data, params[i], param_map, metric, model) for i in range(len(params))
+    ) 
+
+    # note e represents error
+    for i, (vals, e) in enumerate(results):
+        p_maxs[i], EDV[i], ESV[i], stroke[i], EF[i] = vals
+
+        if e is not None:
+            failures += 1
+            for val in param_map:
+                print(f"[fail {failures}] sample {i}: {val['name']}-{val['param']}: {params[i][param_map.index(val)]}")
+                print(f"Error message: {e}")
+
+    return p_maxs, EDV, ESV, stroke, EF
+
+
 
 
 def evaluate_model(data, params, param_map, metric, model="open"):
@@ -250,7 +324,7 @@ def evaluate_model(data, params, param_map, metric, model="open"):
 
 #Instead of providing an array of strings containing parameter names/acronyms,
 # establish a dictionary called param_dict  
-def sobol_sensitivity(data, param_dict, bound, metric, model):    
+def sobol_sensitivity(data, param_dict, bound, metric, model, n_jobs=1):    
     param_indicators, param_map = create_indicators(param_dict)
 
     num_vars = len(param_indicators)
@@ -271,7 +345,8 @@ def sobol_sensitivity(data, param_dict, bound, metric, model):
     # Keep track of the elapsed time of the program 
     startTime = time.time()
 
-    p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric, model)
+    # p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric, model)
+    p_maxs, EDV, ESV, stroke, EF = evaluate_model_parallel(data, params, param_map, metric, model, n_jobs)
 
     # safe_save("./RawOutputs/raw_outputs_6_2_2026_closedloop_samplesize16_bound0.4_test1.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
     # print("Raw outputs saved.")
@@ -393,9 +468,9 @@ def SA_heatmap(Si_s, names, param_dict):
 # End of functions #
 ####################
 
-
-LV_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity/chamber_sphere.json"
-CL_fname = LV_fname = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity/chamber_sphere_closed_loop.json"
+base = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/sensitivity"
+LV_fname = base + "/chamber_sphere.json"
+CL_fname = base + "/chamber_sphere_closed_loop.json"
 
 svZeroDSolver_path = "/mnt/c/Users/jorda/OneDrive/Desktop/School Stuff/Yale Computational Biomechanics Research/Computational Biomechanics - svzerodsolver repo/svZeroDSolver-jt/build/svzerodsolver"
 
@@ -410,7 +485,7 @@ LV_dict = create_dict(LV_baseline_input) # dictionary for (open) chamber sphere
 CL_dict = create_dict(CL_baseline_input)  # dictionary for closed loop chamber sphere 
 
 
-Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open")
+Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 6)
 # Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed")
 
 
