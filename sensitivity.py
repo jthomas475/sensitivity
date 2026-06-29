@@ -11,7 +11,6 @@ import time
 import os
 from joblib import Parallel, delayed
 from contextlib import contextmanager
-from tqdm import tqdm
 
 
 from SALib.sample import sobol as sobol_sample
@@ -163,7 +162,22 @@ def create_indicators(param_dict):
     return param_indicators, param_map
 
 
-#Contextmanager implementation to implement verbose/quiet toggle
+def get_baseline(param_map_entry, data):
+    
+    ves = param_map_entry["name"]
+    param = param_map_entry["param"]
+
+    collection = data["vessels"] if param_map_entry["type"] == "vessel" else data["valves"]
+    key = "vessel_name" if param_map_entry["type"] == "vessel" else "names"
+
+    for item in collection:
+        if item[key] == ves:
+            return item["zero_d_element_values"][param]
+        
+    raise KeyError(f"Baseline not found for {ves}-{param}")
+
+
+# Contextmanager implementation to implement verbose/quiet toggle
 # Utilize that every running program has file descriptors, with
 # 0 representing stdin, 1 stdout, 2 stdin
 @contextmanager
@@ -171,8 +185,10 @@ def quiet_func():
     devnull = os.open(os.devnull, os.O_WRONLY) # open null device and write only
     saved = os.dup(1) # save current stdout to record where stdout is written if 1 file pipeline disrupted
     os.dup2(devnull,1) # make 1 (stdout) point to wherever devnull points
+
     try:
         yield
+
     finally:
         os.dup2(saved, 1)
         os.close(saved) # close the temp descriptor and null point
@@ -247,7 +263,12 @@ def evaluate_sample(data, metric, model="open"):
 # running parallel with n_jobs and default backend module "loky" to "start separate Python worker processes to execute tasks concurrently on separate CPUs." 
 def evaluate_model_parallel(data, params, param_map, metric, model="open", n_jobs=1):
     p_maxs, EDV, ESV, stroke, EF = [np.full(len(params), np.nan) for _ in range(5)]
-    failures = 0
+    
+    num_failures = 0
+    failures = []
+
+    timeInitial = time.time()
+
 
     results = Parallel(n_jobs=n_jobs, return_as = "generator")(
         delayed(evaluate_single)(data, params[i], param_map, metric, model) for i in range(len(params))
@@ -258,12 +279,25 @@ def evaluate_model_parallel(data, params, param_map, metric, model="open", n_job
         p_maxs[i], EDV[i], ESV[i], stroke[i], EF[i] = vals
 
         if e is not None:
-            failures += 1
-            for val in param_map:
-                print(f"[fail {failures}] sample {i}: {val['name']}-{val['param']}: {params[i][param_map.index(val)]}")
-                print(f"Error message: {e}")
+            num_failures += 1
+            
+            # Map each perturbed parameter to the scaler used for this sample
+            param_all = {f"{val['name']}-{val['param']}": params[i][j] for j, val in enumerate(param_map)}
+            param_vals = [params[i][j] for j in range(len(param_map))]
 
-    return p_maxs, EDV, ESV, stroke, EF
+            failures.append((i, param_all, param_vals, e))
+
+            print(f"[fail {num_failures}] sample {i}: {param_all}\n \tError message: {e}\n", flush=True)
+        
+        if i+1 == len(params) or (i+1) % max(1, len(params) // 20) == 0:
+            timeElapsed = time.time() - timeInitial
+            rate = (i+1) / timeElapsed if timeElapsed else 0
+            eta = (len(params) - (i+1)) / rate if rate else 0
+
+            print(f"[{(i+1)}/{len(params)}] {len(failures)} failed, {timeElapsed:.0f}s elapsed, ~{eta:.0f}s left", flush=True)
+
+
+    return p_maxs, EDV, ESV, stroke, EF, failures
 
 
 
@@ -346,7 +380,7 @@ def sobol_sensitivity(data, param_dict, bound, metric, model, n_jobs=1):
     startTime = time.time()
 
     # p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric, model)
-    p_maxs, EDV, ESV, stroke, EF = evaluate_model_parallel(data, params, param_map, metric, model, n_jobs)
+    p_maxs, EDV, ESV, stroke, EF, failures = evaluate_model_parallel(data, params, param_map, metric, model, n_jobs)
 
     # safe_save("./RawOutputs/raw_outputs_6_2_2026_closedloop_samplesize16_bound0.4_test1.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
     # print("Raw outputs saved.")
@@ -388,7 +422,7 @@ def sobol_sensitivity(data, param_dict, bound, metric, model, n_jobs=1):
     Si_stroke = sobol.analyze(problem, stroke, calc_second_order=True, print_to_console=True)
     Si_EF = sobol.analyze(problem, EF, calc_second_order=True, print_to_console=True)
     
-    return Si_p_maxs, Si_EDV, Si_ESV, Si_stroke, Si_EF, problem["outputs"]
+    return Si_p_maxs, Si_EDV, Si_ESV, Si_stroke, Si_EF, problem["outputs"], failures, param_map
 
 
 #####################
@@ -401,7 +435,7 @@ def s2_heatmap(Si, param_dict):
     Si_index_matrix = np.abs(Si[index])
          
     plt.figure(figsize=(10,8))
-    plt.imshow(Si_index_matrix)
+    plt.imshow(Si_index_matrix, vmin=0, vmax=1)
 
     plt.xticks(range(len(param_indicators)), param_indicators, rotation=90)
     plt.yticks(range(len(param_indicators)), param_indicators)
@@ -440,7 +474,7 @@ def SA_heatmap(Si_s, names, param_dict):
 
     # Print heatmap for ST
     plt.figure(figsize=(10,8))
-    plt.imshow(heatmap_ST)
+    plt.imshow(heatmap_ST, vmin=0, vmax=1)
 
     plt.yticks(range(len(param_indicators)), param_indicators)
     plt.xticks(range(len(names)), names, rotation=90)
@@ -453,7 +487,7 @@ def SA_heatmap(Si_s, names, param_dict):
 
     # Print heatmap for SI
     plt.figure(figsize=(10,8))
-    plt.imshow(heatmap_SI)
+    plt.imshow(heatmap_SI, vmin=0, vmax=1)
 
     plt.yticks(range(len(param_indicators)), param_indicators)
     plt.xticks(range(len(names)), names, rotation=90)
@@ -463,6 +497,29 @@ def SA_heatmap(Si_s, names, param_dict):
 
     plt.tight_layout()
     plt.show()   
+
+
+
+def failure_plot(failures, param_map, data):
+    fig, axes = plt.subplots(len(param_map), 1, figsize=(8, 3*len(param_map)), sharex=True)
+    axes = np.atleast_1d(axes)
+
+    f_indexes = [f[0] for f in failures] # sample indexes
+    f_vals = [f[2] for f in failures] # list of perturbed scalers
+
+    for i, ax in enumerate(axes):
+        baseline = get_baseline(param_map[i], data)
+
+        x_data = list(f_indexes)
+        y_data = [vals[i] * baseline for vals in f_vals]
+
+        ax.scatter(x_data, y_data, color="blue")
+        ax.axhline(baseline, color="gray", ls="--") 
+        ax.set_ylabel(f"{param_map[i]['name']}-{param_map[i]['param']}")
+
+    axes[-1].set_xlabel("Sample index")
+    plt.tight_layout()
+    plt.show()
 
 ####################
 # End of functions #
@@ -479,13 +536,13 @@ LV_baseline_input = read_file(LV_fname)
 CL_baseline_input = read_file(CL_fname)
 
 
-bound = [0.8,1.2] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
+bound = [0.6,1.4] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
 
 LV_dict = create_dict(LV_baseline_input) # dictionary for (open) chamber sphere
 CL_dict = create_dict(CL_baseline_input)  # dictionary for closed loop chamber sphere 
 
 
-Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 6)
+Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 6)
 # Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed")
 
 
@@ -535,6 +592,8 @@ SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
 
 SA_heatmap(SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
 # # print(f"S2 values:\n {Si_LV[S2]}")
+
+failure_plot(failures, param_map, LV_baseline_input)
 
 # # checking to see if zerod solver is from a compiled native extension library or my locally built executable
 # print(f"{zerod.__file__}\n")
