@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import pdb
+import matplotlib
 import matplotlib.pyplot as plt
 import pysvzerod as zerod
 import json
@@ -36,6 +37,47 @@ def safe_save(path, data):
     np.save(path, data)
     print(f"Succesfully saved path to '{path}'")
 
+# Directory where all generated figures are written
+FIG_DIR_HEAT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Heatmaps")
+FIG_DIR_CLUST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FailureClusters")
+FIG_DIR_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FailureDists")
+
+
+
+# Save the current figure to FIG_DIR as a png, then show it interactively as well via linux pop-up plotting UI
+def save_and_show(filename, type):
+    if type == "HEAT":
+        os.makedirs(FIG_DIR_HEAT, exist_ok=True)
+
+        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename)
+
+        out = os.path.join(FIG_DIR_HEAT, safe)
+
+
+    elif type == "CLUSTER":
+        os.makedirs(FIG_DIR_CLUST, exist_ok=True)
+
+        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename)
+
+        out = os.path.join(FIG_DIR_CLUST, safe)
+
+        
+    
+    else:
+        os.makedirs(FIG_DIR_DIST, exist_ok=True)
+
+        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename)
+
+        out = os.path.join(FIG_DIR_DIST, safe)
+
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"[figure saved] {out}", flush=True)
+
+    if matplotlib.is_interactive():
+        plt.show(block=False)
+    plt.close()
+
+    
 # Returns the 0D element values of ChamberSphere, Upstream_vessel, and 
 # Downstream_vessel 0D element types/names given data from a parsed
 # file read using read_file function given above 
@@ -162,13 +204,13 @@ def create_indicators(param_dict):
     return param_indicators, param_map
 
 
-def get_baseline(param_map_entry, data):
+def get_baseline(param, data):
     
-    ves = param_map_entry["name"]
-    param = param_map_entry["param"]
+    ves = param["name"]
+    param = param["param"]
 
-    collection = data["vessels"] if param_map_entry["type"] == "vessel" else data["valves"]
-    key = "vessel_name" if param_map_entry["type"] == "vessel" else "names"
+    collection = data["vessels"] if param["type"] == "vessel" else data["valves"]
+    key = "vessel_name" if param["type"] == "vessel" else "names"
 
     for item in collection:
         if item[key] == ves:
@@ -444,7 +486,7 @@ def s2_heatmap(Si, param_dict):
     plt.title(f"Sobol {index} sensitivity analysis heatmap - max pressure")
 
     plt.tight_layout()
-    plt.show()
+    save_and_show("S2_Sobol_SA_heatmap_jun30.png", "HEAT")
 
 # @param Si_s: Array of sobol analysis results
 # @ param: names: The names of the outputs
@@ -483,7 +525,7 @@ def SA_heatmap(Si_s, names, param_dict):
     plt.title(f"Sobol ST sensitivity analysis heatmap")
 
     plt.tight_layout()
-    plt.show()   
+    save_and_show("SA_ST_heatmap_jun30.png","HEAT")
 
     # Print heatmap for SI
     plt.figure(figsize=(10,8))
@@ -496,30 +538,70 @@ def SA_heatmap(Si_s, names, param_dict):
     plt.title(f"Sobol SI sensitivity analysis heatmap")
 
     plt.tight_layout()
-    plt.show()   
+    save_and_show("SA_SI_heatmap_jun30.png","HEAT")
+
+# Create a histogram of parameter values used in failed simulations
+# Failures is a list of the form (sample_index, param_all_dict, scaler_list, error)
+def failure_plot(failures, param_map, data, bound=None):
+    if not failures:
+        print("No failures to plot.")
+        return
+
+    # rows = samples, cols = parameters
+    scalers = np.array([f[2] for f in failures], dtype=float)
+
+    for i, entry in enumerate(param_map):
+        label = f"{entry['name']}-{entry['param']}"
+        vals = scalers[:, i]
+
+        plt.figure(figsize=(8, 4))
+        plt.hist(vals, bins=20, range=tuple(bound) if bound else None, color="tab:red", alpha=0.7, edgecolor="black")
+
+        plt.axvline(1.0, color="gray", ls="--", label="baseline (scaler=1.0)")
+
+        if bound:
+            plt.axvline(bound[0], color="black", ls=":", alpha=0.6)
+            plt.axvline(bound[1], color="black", ls=":", alpha=0.6)
+
+        plt.xlabel(f"{label} perturbation scaler")
+        plt.ylabel(f"# failures (of {len(failures)})")
+
+        plt.title(f"Failure distribution: {label}")
+
+        plt.legend()
+
+        plt.tight_layout()
+        save_and_show(f"failure_dist_{label}_jun30.png","DIST")
 
 
+# Plotting function to produce clusters of failed points for every pair of parameters. If compare_n is set, plot the first compare_n parameters
+def failure_cluster_plot(failures, param_map, compare_n=None):
+    if not failures:
+        print("No failures to plot.")
+        return
 
-def failure_plot(failures, param_map, data):
-    fig, axes = plt.subplots(len(param_map), 1, figsize=(8, 3*len(param_map)), sharex=True)
-    axes = np.atleast_1d(axes)
+    scalers = np.array([f[2] for f in failures], dtype=float)
 
-    f_indexes = [f[0] for f in failures] # sample indexes
-    f_vals = [f[2] for f in failures] # list of perturbed scalers
+    n = len(param_map) if compare_n is None else min(compare_n, len(param_map))
+    
+    for a in range(n):
+        for b in range(a + 1, n):
+            la = f"{param_map[a]['name']}-{param_map[a]['param']}"
+            lb = f"{param_map[b]['name']}-{param_map[b]['param']}"
 
-    for i, ax in enumerate(axes):
-        baseline = get_baseline(param_map[i], data)
+            plt.figure(figsize=(6, 6))
+            plt.scatter(scalers[:, a], scalers[:, b], c="tab:red", alpha=0.5, edgecolor="black")
 
-        x_data = list(f_indexes)
-        y_data = [vals[i] * baseline for vals in f_vals]
+            plt.axvline(1.0, color="gray", ls="--", alpha=0.6)
+            plt.axhline(1.0, color="gray", ls="--", alpha=0.6)
 
-        ax.scatter(x_data, y_data, color="blue")
-        ax.axhline(baseline, color="gray", ls="--") 
-        ax.set_ylabel(f"{param_map[i]['name']}-{param_map[i]['param']}")
+            plt.xlabel(f"{la} scaler")
+            plt.ylabel(f"{lb} scaler")
 
-    axes[-1].set_xlabel("Sample index")
-    plt.tight_layout()
-    plt.show()
+            plt.title(f"Failure clusters: {la} vs {lb}")
+
+            plt.tight_layout()
+            save_and_show(f"failure_cluster_{la}_vs_{lb}_jun30.png", "CLUSTER")
 
 ####################
 # End of functions #
@@ -536,14 +618,14 @@ LV_baseline_input = read_file(LV_fname)
 CL_baseline_input = read_file(CL_fname)
 
 
-bound = [0.6,1.4] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
+bound = [0.2,1.8] # switch from general bound (current approach) to parameter-specific bounds (see literature to discern what bounds should be)
 
 LV_dict = create_dict(LV_baseline_input) # dictionary for (open) chamber sphere
 CL_dict = create_dict(CL_baseline_input)  # dictionary for closed loop chamber sphere 
 
 
-Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 6)
-# Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed")
+# Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 8)
+Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed", 8)
 
 
 # # ###############################
@@ -590,10 +672,14 @@ SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
 
 # safe_save("./Results/SIs_6_2_2026_closedloop_samplesize16_bound0.4_test1", SIs)
 
-SA_heatmap(SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], LV_dict)
+# debugging matplotlib issues: checking backend being used and if interactive window is disabled or not present
+print(f"[matplotlib] backend={matplotlib.get_backend()} interactive={matplotlib.is_interactive()} -> figures written to {FIG_DIR}", flush=True)
+
+SA_heatmap(SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], CL_dict)
 # # print(f"S2 values:\n {Si_LV[S2]}")
 
-failure_plot(failures, param_map, LV_baseline_input)
+failure_plot(failures, param_map, CL_baseline_input, bound)
+failure_cluster_plot(failures, param_map)
 
 # # checking to see if zerod solver is from a compiled native extension library or my locally built executable
 # print(f"{zerod.__file__}\n")
