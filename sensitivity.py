@@ -40,7 +40,8 @@ def safe_save(path, data):
 # Directory where all generated figures are written
 FIG_DIR_HEAT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Heatmaps")
 FIG_DIR_CLUST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FailureClusters")
-FIG_DIR_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FailureDists")
+FIG_DIR_F_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FailureDists")
+FIG_DIR_S_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SuccessDists")
 
 
 
@@ -61,14 +62,21 @@ def save_and_show(filename, type):
 
         out = os.path.join(FIG_DIR_CLUST, safe)
 
-        
     
-    else:
-        os.makedirs(FIG_DIR_DIST, exist_ok=True)
+    elif type == "S_DIST":
+        os.makedirs(FIG_DIR_S_DIST, exist_ok=True)
 
         safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename)
 
-        out = os.path.join(FIG_DIR_DIST, safe)
+        out = os.path.join(FIG_DIR_S_DIST, safe)
+
+    
+    else:
+        os.makedirs(FIG_DIR_F_DIST, exist_ok=True)
+
+        safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in filename)
+
+        out = os.path.join(FIG_DIR_F_DIST, safe)
 
     plt.savefig(out, dpi=150, bbox_inches="tight")
     print(f"[figure saved] {out}", flush=True)
@@ -309,6 +317,8 @@ def evaluate_model_parallel(data, params, param_map, metric, model="open", n_job
     num_failures = 0
     failures = []
 
+    successes = []
+
     timeInitial = time.time()
 
 
@@ -331,6 +341,12 @@ def evaluate_model_parallel(data, params, param_map, metric, model="open", n_job
 
             print(f"[fail {num_failures}] sample {i}: {param_all}\n \tError message: {e}\n", flush=True)
         
+        else:
+            param_all = {f"{val['name']}-{val['param']}": params[i][j] for j, val in enumerate(param_map)}
+            param_vals = [params[i][j] for j in range(len(param_map))]
+
+            successes.append((i, param_all, param_vals))
+        
         if i+1 == len(params) or (i+1) % max(1, len(params) // 20) == 0:
             timeElapsed = time.time() - timeInitial
             rate = (i+1) / timeElapsed if timeElapsed else 0
@@ -339,7 +355,7 @@ def evaluate_model_parallel(data, params, param_map, metric, model="open", n_job
             print(f"[{(i+1)}/{len(params)}] {len(failures)} failed, {timeElapsed:.0f}s elapsed, ~{eta:.0f}s left", flush=True)
 
 
-    return p_maxs, EDV, ESV, stroke, EF, failures
+    return p_maxs, EDV, ESV, stroke, EF, failures, successes
 
 
 
@@ -416,13 +432,13 @@ def sobol_sensitivity(data, param_dict, bound, metric, model, n_jobs=1):
     # double or quadurple sample size). Want to keep sample size power of 2
     # This step generates the set of model inputs
     # Total # of model evaluations will be N (2*NV+2), where NV is number of variables (given NV>1)
-    params = sobol_sample.sample(problem, 16, calc_second_order=True) 
+    params = sobol_sample.sample(problem, 8, calc_second_order=True) 
 
     # Keep track of the elapsed time of the program 
     startTime = time.time()
 
     # p_maxs, EDV, ESV, stroke, EF = evaluate_model(data, params, param_map, metric, model)
-    p_maxs, EDV, ESV, stroke, EF, failures = evaluate_model_parallel(data, params, param_map, metric, model, n_jobs)
+    p_maxs, EDV, ESV, stroke, EF, failures, successes = evaluate_model_parallel(data, params, param_map, metric, model, n_jobs)
 
     # safe_save("./RawOutputs/raw_outputs_6_2_2026_closedloop_samplesize16_bound0.4_test1.npy", np.stack([p_maxs, EDV, ESV, stroke, EF]))
     # print("Raw outputs saved.")
@@ -464,7 +480,7 @@ def sobol_sensitivity(data, param_dict, bound, metric, model, n_jobs=1):
     Si_stroke = sobol.analyze(problem, stroke, calc_second_order=True, print_to_console=True)
     Si_EF = sobol.analyze(problem, EF, calc_second_order=True, print_to_console=True)
     
-    return Si_p_maxs, Si_EDV, Si_ESV, Si_stroke, Si_EF, problem["outputs"], failures, param_map
+    return Si_p_maxs, Si_EDV, Si_ESV, Si_stroke, Si_EF, problem["outputs"], failures, param_map, successes
 
 
 #####################
@@ -486,7 +502,7 @@ def s2_heatmap(Si, param_dict):
     plt.title(f"Sobol {index} sensitivity analysis heatmap - max pressure")
 
     plt.tight_layout()
-    save_and_show("S2_Sobol_SA_heatmap_jun30.png", "HEAT")
+    save_and_show("S2_Sobol_SA_heatmap_jul8_Caruel.png", "HEAT")
 
 # @param Si_s: Array of sobol analysis results
 # @ param: names: The names of the outputs
@@ -525,7 +541,7 @@ def SA_heatmap(Si_s, names, param_dict):
     plt.title(f"Sobol ST sensitivity analysis heatmap")
 
     plt.tight_layout()
-    save_and_show("SA_ST_heatmap_jun30.png","HEAT")
+    save_and_show("SA_ST_heatmap_jul8_Caruel.png","HEAT")
 
     # Print heatmap for SI
     plt.figure(figsize=(10,8))
@@ -538,11 +554,11 @@ def SA_heatmap(Si_s, names, param_dict):
     plt.title(f"Sobol SI sensitivity analysis heatmap")
 
     plt.tight_layout()
-    save_and_show("SA_SI_heatmap_jun30.png","HEAT")
+    save_and_show("SA_SI_heatmap_jul8_Caruel.png","HEAT")
 
 # Create a histogram of parameter values used in failed simulations
 # Failures is a list of the form (sample_index, param_all_dict, scaler_list, error)
-def failure_plot(failures, param_map, data, bound=None):
+def failure_plot(failures, param_map, bound=None):
     if not failures:
         print("No failures to plot.")
         return
@@ -571,7 +587,40 @@ def failure_plot(failures, param_map, data, bound=None):
         plt.legend()
 
         plt.tight_layout()
-        save_and_show(f"failure_dist_{label}_jun30.png","DIST")
+        save_and_show(f"failure_dist_{label}_jul8_Caruel.png","F_DIST")
+
+
+def successful_plot(successes, param_map, bound=None):
+    if not successes:
+        print("All simulations failed - no successful runs to plot.")
+        return
+    
+    scalers = np.array([s[2] for s in successes], dtype=float)
+
+    for i, entry in enumerate(param_map):
+        label = f"{entry['name']}-{entry['param']}"
+        vals = scalers[:, i]
+
+        plt.figure(figsize=(8, 4))
+        plt.hist(vals, bins=20, range=tuple(bound) if bound else None, color="tab:red", alpha=0.7, edgecolor="black")
+
+        plt.axvline(1.0, color="gray", ls="--", label="baseline (scaler=1.0)")
+
+        if bound:
+            plt.axvline(bound[0], color="black", ls=":", alpha=0.6)
+            plt.axvline(bound[1], color="black", ls=":", alpha=0.6)
+
+        plt.xlabel(f"{label} perturbation scaler")
+        plt.ylabel(f"# successes (of {len(successes)})")
+
+        plt.title(f"Success distribution: {label}")
+
+        plt.legend()
+
+        plt.tight_layout()
+        save_and_show(f"success_dist_{label}_jul8_Caruel.png","S_DIST")
+
+
 
 
 # Plotting function to produce clusters of failed points for every pair of parameters. If compare_n is set, plot the first compare_n parameters
@@ -601,7 +650,7 @@ def failure_cluster_plot(failures, param_map, compare_n=None):
             plt.title(f"Failure clusters: {la} vs {lb}")
 
             plt.tight_layout()
-            save_and_show(f"failure_cluster_{la}_vs_{lb}_jun30.png", "CLUSTER")
+            save_and_show(f"failure_cluster_{la}_vs_{lb}_jul8_Caruel.png", "CLUSTER")
 
 ####################
 # End of functions #
@@ -624,8 +673,8 @@ LV_dict = create_dict(LV_baseline_input) # dictionary for (open) chamber sphere
 CL_dict = create_dict(CL_baseline_input)  # dictionary for closed loop chamber sphere 
 
 
-# Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 8)
-Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed", 8)
+# Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map, successes = sobol_sensitivity(LV_baseline_input, LV_dict, bound, "max", "open", 8)
+Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF, output_names, failures, param_map, successes = sobol_sensitivity(CL_baseline_input, CL_dict, bound, "max", "closed", 8)
 
 
 # # ###############################
@@ -673,13 +722,15 @@ SIs = [Si_y, Si_EDV, Si_ESV, Si_stroke, Si_EF]
 # safe_save("./Results/SIs_6_2_2026_closedloop_samplesize16_bound0.4_test1", SIs)
 
 # debugging matplotlib issues: checking backend being used and if interactive window is disabled or not present
-print(f"[matplotlib] backend={matplotlib.get_backend()} interactive={matplotlib.is_interactive()} -> figures written to {FIG_DIR}", flush=True)
+# print(f"[matplotlib] backend={matplotlib.get_backend()} interactive={matplotlib.is_interactive()} -> figures written to {FIG_DIR}", flush=True)
 
 SA_heatmap(SIs, ["Max Pressure","EDV","ESV","STROKE","EF"], CL_dict)
 # # print(f"S2 values:\n {Si_LV[S2]}")
 
-failure_plot(failures, param_map, CL_baseline_input, bound)
-failure_cluster_plot(failures, param_map)
+failure_plot(failures, param_map, bound)
+successful_plot(successes, param_map, bound)
+
+failure_cluster_plot(failures, param_map, 5)
 
 # # checking to see if zerod solver is from a compiled native extension library or my locally built executable
 # print(f"{zerod.__file__}\n")
